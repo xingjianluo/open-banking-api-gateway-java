@@ -10,12 +10,15 @@ import org.springframework.stereotype.Service;
 import com.github.xingjianluo.openbankingapigatewayjava.common.ApiException;
 import com.github.xingjianluo.openbankingapigatewayjava.common.ErrorCode;
 import com.github.xingjianluo.openbankingapigatewayjava.common.ErrorResponse;
+import com.github.xingjianluo.openbankingapigatewayjava.consent.Consent;
 import com.github.xingjianluo.openbankingapigatewayjava.consent.ConsentService;
 import com.github.xingjianluo.openbankingapigatewayjava.consent.PermissionScope;
 import com.github.xingjianluo.openbankingapigatewayjava.idempotency.IdempotencyDecision;
 import com.github.xingjianluo.openbankingapigatewayjava.idempotency.IdempotencyOutcome;
 import com.github.xingjianluo.openbankingapigatewayjava.idempotency.IdempotencyRecord;
 import com.github.xingjianluo.openbankingapigatewayjava.idempotency.IdempotencyService;
+import com.github.xingjianluo.openbankingapigatewayjava.limit.LimitReservation;
+import com.github.xingjianluo.openbankingapigatewayjava.limit.LimitService;
 import com.github.xingjianluo.openbankingapigatewayjava.partner.Partner;
 import com.github.xingjianluo.openbankingapigatewayjava.partner.PartnerRepository;
 import com.github.xingjianluo.openbankingapigatewayjava.quota.QuotaService;
@@ -26,9 +29,10 @@ import com.github.xingjianluo.openbankingapigatewayjava.version.ApiVersion;
 /**
  * 支付发起/查询的编排服务。
  *
- * <p>创建链路顺序固定：<em>版本协商 → 幂等判定 → 合作方解析 → 同意授权 → 配额 → 下游副作用</em>。
+ * <p>创建链路顺序固定：<em>版本协商 → 幂等判定 → 合作方解析 → 同意授权 → 额度预占 → 配额 → 下游副作用</em>。
  * 只有拿到 PROCEED 的唯一请求会走到下游并产生一次副作用；任何环节的失败结论都会作为
- * 该幂等键的确定性快照缓存，后续同键同内容重放得到完全相同的结论，不重复执行。</p>
+ * 该幂等键的确定性快照缓存，后续同键同内容重放得到完全相同的结论，不重复执行。
+ * 额度预占只在副作用真正落账时转为累计用量，失败路径全额归还。</p>
  */
 @Service
 public class PaymentService {
@@ -39,6 +43,7 @@ public class PaymentService {
     private final ConsentService consentService;
     private final IdempotencyService idempotencyService;
     private final QuotaService quotaService;
+    private final LimitService limitService;
     private final UpstreamService upstreamService;
     private final PaymentRepository paymentRepository;
 
@@ -46,12 +51,14 @@ public class PaymentService {
                           ConsentService consentService,
                           IdempotencyService idempotencyService,
                           QuotaService quotaService,
+                          LimitService limitService,
                           UpstreamService upstreamService,
                           PaymentRepository paymentRepository) {
         this.partnerRepository = partnerRepository;
         this.consentService = consentService;
         this.idempotencyService = idempotencyService;
         this.quotaService = quotaService;
+        this.limitService = limitService;
         this.upstreamService = upstreamService;
         this.paymentRepository = paymentRepository;
     }
@@ -90,28 +97,41 @@ public class PaymentService {
             Partner partner = partnerRepository.findById(partnerId)
                     .orElseThrow(() -> new ApiException(ErrorCode.PARTNER_UNKNOWN,
                             "partnerId=" + partnerId));
-            consentService.authorize(partner, consentId, PermissionScope.PAYMENTS_INITIATE);
-            quotaService.acquire(partnerId);
+            Consent consent = consentService.authorize(partner, consentId,
+                    PermissionScope.PAYMENTS_INITIATE);
+            // 额度判定与预占：基于授权阶段读到的同一不可变快照；未配置额度的同意返回 null
+            LimitReservation reservation = limitService.reserve(consent,
+                    request.amount(), request.currency());
+            boolean committed = false;
+            try {
+                quotaService.acquire(partnerId);
 
-            String paymentId = "PAY-" + UUID.randomUUID();
-            // 唯一一次副作用：调用下游核心并落资源
-            String ledgerNo = upstreamService.postPaymentInstruction(paymentId, failUpstream);
-            PaymentResponse response = new PaymentResponse(
-                    paymentId,
-                    request.paymentRef(),
-                    "INITIATED",
-                    ledgerNo,
-                    request.effectivePriority(),
-                    version.name(),
-                    partnerId,
-                    consentId,
-                    Instant.now());
-            paymentRepository.save(response);
+                String paymentId = "PAY-" + UUID.randomUUID();
+                // 唯一一次副作用：调用下游核心并落资源
+                String ledgerNo = upstreamService.postPaymentInstruction(paymentId, failUpstream);
+                PaymentResponse response = new PaymentResponse(
+                        paymentId,
+                        request.paymentRef(),
+                        "INITIATED",
+                        ledgerNo,
+                        request.effectivePriority(),
+                        version.name(),
+                        partnerId,
+                        consentId,
+                        Instant.now());
+                paymentRepository.save(response);
+                committed = true;
 
-            idempotencyService.complete(record, 201, response);
-            log.info("支付创建成功 请求输入 partnerId={} consentId={} idemKey={} paymentRef={} 判定依据=全部检查通过 paymentId={} ledgerNo={}",
-                    partnerId, consentId, idemKey, request.paymentRef(), paymentId, ledgerNo);
-            return new CreateResult(IdempotencyOutcome.PROCEED, 201, response);
+                idempotencyService.complete(record, 201, response);
+                log.info("支付创建成功 请求输入 partnerId={} consentId={} idemKey={} paymentRef={} 判定依据=全部检查通过 paymentId={} ledgerNo={}",
+                        partnerId, consentId, idemKey, request.paymentRef(), paymentId, ledgerNo);
+                return new CreateResult(IdempotencyOutcome.PROCEED, 201, response);
+            } finally {
+                if (!committed) {
+                    // 配额拒绝/下游异常等未落账路径：全额归还预占，不白吃额度
+                    limitService.release(reservation);
+                }
+            }
         } catch (ApiException ex) {
             // 业务拒绝：缓存稳定错误语义作为该键的确定结论
             ErrorResponse body = ErrorResponse.of(ex.errorCode(), ex.reason());

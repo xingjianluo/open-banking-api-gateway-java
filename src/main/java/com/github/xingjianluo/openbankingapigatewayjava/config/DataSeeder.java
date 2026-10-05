@@ -71,6 +71,12 @@ public class DataSeeder {
             consentRepository.save(Consent.authorised("consent-cross", "partner-limited",
                     Set.of(PermissionScope.PAYMENTS_INITIATE, PermissionScope.PAYMENTS_READ),
                     now.minus(1, ChronoUnit.HOURS), now.plus(7, ChronoUnit.DAYS)));
+            // 带额度的同意：单笔上限 100 GBP，累计上限 250 GBP
+            consentRepository.save(Consent.authorised("consent-limited", "partner-a",
+                    Set.of(PermissionScope.PAYMENTS_INITIATE, PermissionScope.PAYMENTS_READ),
+                    now.minus(1, ChronoUnit.HOURS), now.plus(7, ChronoUnit.DAYS))
+                    .withLimits(new java.math.BigDecimal("100.00"),
+                            new java.math.BigDecimal("250.00"), "GBP"));
 
             quotaService.configureLimit("partner-a", 1000);
             quotaService.configureLimit("partner-limited", 2);

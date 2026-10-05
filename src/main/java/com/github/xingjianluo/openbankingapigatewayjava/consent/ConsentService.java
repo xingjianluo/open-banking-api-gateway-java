@@ -111,4 +111,81 @@ public class ConsentService {
             // CAS 失败说明有并发修改，重读重试
         }
     }
+
+    /**
+     * 调整额度（本地管理侧）：可上调或下调单笔/累计上限并约定币种，三者整体替换。
+     *
+     * <p>并发语义与撤销相同：CAS 原子替换整个不可变快照。正在进行的支付请求持有的是
+     * 进入时读到的完整旧快照或完整新快照，判定结论对那次请求是确定的——不会观察到
+     * "新单笔上限 + 旧累计上限"之类的中间组合。REVOKED 终态不允许再调整。</p>
+     *
+     * @return 调整后的新快照
+     */
+    public Consent adjustLimits(String consentId, java.math.BigDecimal perPaymentLimit,
+                                java.math.BigDecimal totalLimit, String currency) {
+        if (perPaymentLimit == null || perPaymentLimit.signum() <= 0
+                || totalLimit == null || totalLimit.signum() <= 0
+                || currency == null || currency.isBlank()) {
+            throw new ApiException(ErrorCode.VALIDATION_FAILED,
+                    "perPaymentLimit/totalLimit 必须为正数，currency 必须提供");
+        }
+        String normalizedCurrency = currency.trim().toUpperCase();
+        while (true) {
+            Consent current = consentRepository.findById(consentId).orElse(null);
+            if (current == null) {
+                throw new ApiException(ErrorCode.CONSENT_NOT_FOUND, "consentId=" + consentId);
+            }
+            if (current.status() == ConsentStatus.REVOKED) {
+                log.info("额度调整拒绝 consentId={} 判定依据=同意已是REVOKED终态", consentId);
+                throw new ApiException(ErrorCode.CONSENT_REVOKED,
+                        "consentId=" + consentId + " 已撤销，不允许调整额度");
+            }
+            Consent updated = current.withLimits(perPaymentLimit, totalLimit, normalizedCurrency);
+            if (consentRepository.compareAndRevoke(current, updated)) {
+                log.info("额度调整成功 consentId={} perPaymentLimit={} totalLimit={} currency={} (旧值 per={} total={} ccy={})",
+                        consentId, perPaymentLimit, totalLimit, normalizedCurrency,
+                        current.perPaymentLimit(), current.totalLimit(), current.limitCurrency());
+                return updated;
+            }
+            // CAS 失败说明有并发修改，重读重试
+        }
+    }
+
+    /**
+     * 延长有效期（续期）：新截止时间必须晚于当前截止时间，只能延长不能缩短。
+     * 已过期的同意可通过续期恢复有效；REVOKED 终态不允许续期。
+     * 并发语义同 {@link #adjustLimits}：整体快照 CAS 替换，无中间态。
+     *
+     * @return 续期后的新快照
+     */
+    public Consent renew(String consentId, Instant newExpiresAt) {
+        if (newExpiresAt == null) {
+            throw new ApiException(ErrorCode.VALIDATION_FAILED, "newExpiresAt 必须提供");
+        }
+        while (true) {
+            Consent current = consentRepository.findById(consentId).orElse(null);
+            if (current == null) {
+                throw new ApiException(ErrorCode.CONSENT_NOT_FOUND, "consentId=" + consentId);
+            }
+            if (current.status() == ConsentStatus.REVOKED) {
+                log.info("续期拒绝 consentId={} 判定依据=同意已是REVOKED终态", consentId);
+                throw new ApiException(ErrorCode.CONSENT_REVOKED,
+                        "consentId=" + consentId + " 已撤销，不允许续期");
+            }
+            if (!newExpiresAt.isAfter(current.expiresAt())) {
+                log.info("续期拒绝 consentId={} 判定依据=新截止时间{}不晚于当前{}，仅允许延长",
+                        consentId, newExpiresAt, current.expiresAt());
+                throw new ApiException(ErrorCode.VALIDATION_FAILED,
+                        "新截止时间 " + newExpiresAt + " 必须晚于当前截止 " + current.expiresAt()
+                                + "（仅支持延长有效期）");
+            }
+            Consent renewed = current.withExpiresAt(newExpiresAt);
+            if (consentRepository.compareAndRevoke(current, renewed)) {
+                log.info("续期成功 consentId={} expiresAt {} -> {}", consentId,
+                        current.expiresAt(), newExpiresAt);
+                return renewed;
+            }
+            // CAS 失败说明有并发修改，重读重试
+        }
+    }
 }

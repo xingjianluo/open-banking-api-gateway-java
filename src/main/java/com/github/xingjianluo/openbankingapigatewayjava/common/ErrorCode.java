@@ -13,7 +13,9 @@ import org.springframework.http.HttpStatus;
  *       SCOPE_INSUFFICIENT / RESOURCE_NOT_FOUND 五种拒绝原因互不相同；</li>
  *   <li>幂等：IDEMPOTENCY_IN_FLIGHT / IDEMPOTENCY_CONFLICT / IDEMPOTENCY_KEY_EXPIRED；</li>
  *   <li>版本：VERSION_UNSUPPORTED / VERSION_DEPRECATED；</li>
- *   <li>配额与依赖：QUOTA_EXCEEDED / UPSTREAM_UNAVAILABLE / INTERNAL_ERROR。</li>
+ *   <li>配额与依赖：QUOTA_EXCEEDED / UPSTREAM_UNAVAILABLE / INTERNAL_ERROR；</li>
+ *   <li>同意额度：LIMIT_PER_PAYMENT_EXCEEDED / LIMIT_TOTAL_EXCEEDED /
+ *       CONSENT_CURRENCY_MISMATCH 三种额度拒绝原因互不相同。</li>
  * </ul>
  */
 public enum ErrorCode {
@@ -56,6 +58,15 @@ public enum ErrorCode {
 
     /** 合作方调用配额已用尽。 */
     QUOTA_EXCEEDED("调用配额已用尽", HttpStatus.TOO_MANY_REQUESTS),
+
+    /** 单笔金额超过该同意约定的单笔上限。 */
+    LIMIT_PER_PAYMENT_EXCEEDED("单笔金额超过同意约定的单笔上限", HttpStatus.FORBIDDEN),
+
+    /** 本次占用会使该同意的累计用量超过累计上限。 */
+    LIMIT_TOTAL_EXCEEDED("同意累计额度不足", HttpStatus.FORBIDDEN),
+
+    /** 请求币种与同意约定的币种不一致。 */
+    CONSENT_CURRENCY_MISMATCH("请求币种与同意约定的币种不一致", HttpStatus.FORBIDDEN),
 
     /** 下游银行核心依赖异常：对外只暴露稳定语义，不透出内部细节。 */
     UPSTREAM_UNAVAILABLE("下游服务暂时不可用", HttpStatus.SERVICE_UNAVAILABLE),
