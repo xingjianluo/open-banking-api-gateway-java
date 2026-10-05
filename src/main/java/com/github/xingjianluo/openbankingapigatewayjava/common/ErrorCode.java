@@ -11,6 +11,8 @@ import org.springframework.http.HttpStatus;
  * <ul>
  *   <li>同意与访问控制：CONSENT_NOT_FOUND / CONSENT_EXPIRED / CONSENT_REVOKED /
  *       SCOPE_INSUFFICIENT / RESOURCE_NOT_FOUND 五种拒绝原因互不相同；</li>
+ *   <li>额度：PAYMENT_LIMIT_EXCEEDED / CUMULATIVE_LIMIT_EXCEEDED / CURRENCY_MISMATCH
+ *       三种额度拒绝原因互不相同；</li>
  *   <li>幂等：IDEMPOTENCY_IN_FLIGHT / IDEMPOTENCY_CONFLICT / IDEMPOTENCY_KEY_EXPIRED；</li>
  *   <li>版本：VERSION_UNSUPPORTED / VERSION_DEPRECATED；</li>
  *   <li>配额与依赖：QUOTA_EXCEEDED / UPSTREAM_UNAVAILABLE / INTERNAL_ERROR。</li>
@@ -38,6 +40,15 @@ public enum ErrorCode {
 
     /** 同意合法但所访问的业务资源不存在（或不属于该合作方）。 */
     RESOURCE_NOT_FOUND("资源不存在", HttpStatus.NOT_FOUND),
+
+    /** 单笔支付金额超过该同意约定的单笔上限。 */
+    PAYMENT_LIMIT_EXCEEDED("单笔金额超过同意约定的单笔上限", HttpStatus.FORBIDDEN),
+
+    /** 本次占用后将超过该同意约定的累计上限。 */
+    CUMULATIVE_LIMIT_EXCEEDED("累计额度不足，本次占用将超出累计上限", HttpStatus.FORBIDDEN),
+
+    /** 请求币种与同意约定的额度币种不一致。 */
+    CURRENCY_MISMATCH("请求币种与同意约定的币种不一致", HttpStatus.FORBIDDEN),
 
     /** 同一幂等键的并发请求：首个请求仍在处理中，本次请求未产生副作用。 */
     IDEMPOTENCY_IN_FLIGHT("相同幂等键的请求正在处理中", HttpStatus.CONFLICT),

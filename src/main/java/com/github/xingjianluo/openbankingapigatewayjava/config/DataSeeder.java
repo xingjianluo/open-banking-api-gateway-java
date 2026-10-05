@@ -71,11 +71,16 @@ public class DataSeeder {
             consentRepository.save(Consent.authorised("consent-cross", "partner-limited",
                     Set.of(PermissionScope.PAYMENTS_INITIATE, PermissionScope.PAYMENTS_READ),
                     now.minus(1, ChronoUnit.HOURS), now.plus(7, ChronoUnit.DAYS)));
+            // 带额度约束的同意：单笔上限 100、累计上限 250、约定币种 GBP
+            consentRepository.save(Consent.authorisedWithLimits("consent-capped", "partner-a",
+                    Set.of(PermissionScope.PAYMENTS_INITIATE, PermissionScope.PAYMENTS_READ),
+                    now.minus(1, ChronoUnit.HOURS), now.plus(7, ChronoUnit.DAYS),
+                    new java.math.BigDecimal("100.00"), new java.math.BigDecimal("250.00"), "GBP"));
 
             quotaService.configureLimit("partner-a", 1000);
             quotaService.configureLimit("partner-limited", 2);
 
-            log.info("演示数据初始化完成：合作方[partner-a, partner-limited]，同意[consent-ok, consent-expired, consent-revoked, consent-noinitiate, consent-cross]");
+            log.info("演示数据初始化完成：合作方[partner-a, partner-limited]，同意[consent-ok, consent-expired, consent-revoked, consent-noinitiate, consent-cross, consent-capped(单笔100/累计250/GBP)]");
         };
     }
 }

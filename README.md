@@ -1,9 +1,9 @@
 # Open Banking API Gateway（本地集成与授权访问流程演练）
 
 一个基于 Spring Boot 3 / Java 21 的**开放银行风格网关**本地实现。不依赖外部授权服务器、
-数据库或银行核心系统，全部用进程内组件模拟「合作方 → 客户同意 → 授权访问 → 幂等提交 →
-多版本兼容 → 配额/下游容错」链路，目标是让**权限、幂等与版本兼容在并发调用下得到一致且
-可解释的结论**。
+数据库或银行核心系统，全部用进程内组件模拟「合作方 → 客户同意 → 授权访问 → 额度管控 →
+幂等提交 → 多版本兼容 → 配额/下游容错」链路，目标是让**权限、额度、幂等与版本兼容在并发
+调用下得到一致且可解释的结论**。
 
 ---
 
@@ -18,13 +18,14 @@
 ### 1.2 同意（Consent）
 
 客户授予某个合作方、在有效期内、针对一组 scope 的访问许可。字段：
-`consentId / partnerId / scopes / status / createdAt / expiresAt / revokedAt`。
+`consentId / partnerId / scopes / status / createdAt / expiresAt / revokedAt`，
+以及可选额度字段 `perPaymentLimit / cumulativeLimit / limitCurrency`（见第 2 节）。
 
 - 状态：`AUTHORISED`（有效）→ 终态 `REVOKED`（显式撤销）；`EXPIRED` 由 `expiresAt` 动态判定。
-- **不可变快照**：`Consent` 是 record，撤销不就地改字段，而是由仓储用 CAS
-  （`ConcurrentMap.replace(old,new)`）原子替换为新的 REVOKED 快照。任何线程读到的永远是
-  完整的旧快照或完整的新快照，授权判定基于同一组不可变引用，**并发期间不存在半更新、
-  中途可见的不一致结果**。
+- **不可变快照**：`Consent` 是 record，撤销、调额、续期都不就地改字段，而是由仓储用
+  CAS（`ConcurrentMap.replace(old,new)`）原子替换为新快照。任何线程读到的永远是
+  完整的旧快照或完整的新快照，授权/额度判定基于同一组不可变引用，**并发期间不存在
+  半更新、中途可见的不一致结果**。
 
 ### 1.3 授权判定（双重 scope 满足）
 
@@ -42,11 +43,62 @@
 > 撤销优先于过期判定（撤销是主动行为）；资源存在性在授权通过后才检查，避免未授权探测。
 
 预置同意：`consent-ok`（有效）、`consent-expired`（过期）、`consent-revoked`（已撤销）、
-`consent-noinitiate`（有效但只含 read）、`consent-cross`（归属 partner-limited）。
+`consent-noinitiate`（有效但只含 read）、`consent-cross`（归属 partner-limited）、
+`consent-capped`（带额度：单笔 100 / 累计 250 / GBP）。
 
 ---
 
-## 2. 幂等提交与重放防护
+## 2. 同意额度与累计用量
+
+同意除"能不能调用"（授权）外，还可携带"能用多少"（额度）。额度字段挂在 `Consent`
+不可变快照上，创建与调整都走本地管理接口；**三个字段均可选，缺省即不约束**，
+未配置额度的同意行为与引入本能力之前完全一致。
+
+### 2.1 额度模型
+
+| 字段 | 含义 | 缺省 |
+|---|---|---|
+| `perPaymentLimit` | 单笔支付金额上限 | null = 不限制 |
+| `cumulativeLimit` | 累计成功支付金额上限 | null = 不限制 |
+| `limitCurrency` | 额度约定币种（ISO 4217） | null = 不限制币种 |
+| `used`（用量账本） | 该同意已落账的累计金额，按 consentId 独立记账 | 0 |
+
+发起支付时在授权通过之后、配额与下游之前做额度判定，**判定依据与授权判定是同一份
+同意快照**，固定顺序、三种拒绝原因互不相同：
+
+| 顺序 | 情形 | 错误码 | HTTP |
+|---|---|---|---|
+| 1 | 约定了币种且请求币种不一致 | `CURRENCY_MISMATCH` | 403 |
+| 2 | 约定了单笔上限且金额超过 | `PAYMENT_LIMIT_EXCEEDED` | 403 |
+| 3 | 约定了累计上限且"已用+本次"将超出 | `CUMULATIVE_LIMIT_EXCEEDED` | 403 |
+
+额度内的请求继续走原有的授权、幂等、配额、下游链路，不做任何改变。
+
+### 2.2 并发一致性语义
+
+- **不透支**：累计用量是每同意一个 `AtomicReference<BigDecimal>`，"读已用 → 校验
+  不超上限 → 写入新已用"用 CAS 循环一次完成。剩余额度只够一笔时，并发请求中只有一个
+  CAS 成功，其余重试时读到新余额并以 `CUMULATIVE_LIMIT_EXCEEDED` 拒绝——不会同时读到
+  旧余额一起通过。成功请求的累计金额绝不会超过判定时所依据的累计上限。
+- **只计真实副作用**：判定通过即**预占**（金额计入用量）；预占之后任何失败
+  （配额 429、下游 503 等副作用未落账的情况）都通过幂等的 `release()` 退回预占，
+  重复/并发释放只退一次。被拒绝的请求在预占前就已抛出、幂等重放根本走不到额度判定，
+  两者都不消耗额度；同键重放拿到的是首次缓存的确定结果，不重复累计。
+- **调额/续期无中间态**：调额（`POST /local/consents/{id}/limits`，可上调/下调/取消
+  约束）与续期（`POST /local/consents/{id}/extend`）都是把同意快照整体 CAS 替换。
+  并发进行中的支付只读到调整前或调整后的**完整快照之一**，结论相对所读快照确定：
+  例如下调后新请求按新上限拒绝、上调后新请求放行，而已有用量不受调额影响。
+
+### 2.3 版本兼容范围
+
+- 支付请求体**没有**新增字段；额度信息完全在服务端同意模型上，老调用方零改造。
+- 老方式创建的同意（不带额度字段）= 无约束，行为与之前逐字节一致。
+- `v0` 依旧 `VERSION_DEPRECATED`、未知版本依旧 `VERSION_UNSUPPORTED`，
+  不因新能力静默降级。
+
+---
+
+## 3. 幂等提交与重放防护
 
 对 `POST /api/payments`：
 
@@ -74,7 +126,7 @@
 
 ---
 
-## 3. 多版本兼容
+## 4. 多版本兼容
 
 请求头 `X-Api-Version`（接受 `1` / `v1` 等写法）：
 
@@ -94,7 +146,7 @@
 
 ---
 
-## 4. 统一错误语义
+## 5. 统一错误语义
 
 所有错误返回稳定结构，**不泄漏内部实现细节**（无堆栈/主机名/SQL/下游报文）：
 
@@ -114,6 +166,7 @@
 | `VERSION_DEPRECATED` | 400 | 版本已废弃且不兼容 |
 | `PARTNER_UNKNOWN` | 401 | 合作方缺失/不存在 |
 | `CONSENT_NOT_FOUND` / `CONSENT_REVOKED` / `CONSENT_EXPIRED` / `SCOPE_INSUFFICIENT` | 403 | 四种可区分的授权拒绝 |
+| `PAYMENT_LIMIT_EXCEEDED` / `CUMULATIVE_LIMIT_EXCEEDED` / `CURRENCY_MISMATCH` | 403 | 三种可区分的额度拒绝（单笔超限 / 累计将超 / 币种不符） |
 | `RESOURCE_NOT_FOUND` | 404 | 资源不存在/跨租户不可见 |
 | `IDEMPOTENCY_IN_FLIGHT` / `IDEMPOTENCY_CONFLICT` | 409 | 处理中并发 / 内容或归属冲突 |
 | `IDEMPOTENCY_KEY_EXPIRED` | 410 | 幂等键超期复用 |
@@ -123,7 +176,7 @@
 
 ---
 
-## 5. HTTP 接口
+## 6. HTTP 接口
 
 ### 对外（开放银行风格）
 
@@ -135,18 +188,23 @@
 ### 本地管理（仅演练用，`/local/**`）
 
 - `POST /local/partners` 注册合作方
-- `POST /local/consents` 构造同意（`ttlSeconds` 传负数可造过期同意）
+- `POST /local/consents` 构造同意（`ttlSeconds` 传负数可造过期同意；可选
+  `perPaymentLimit / cumulativeLimit / limitCurrency` 带额度）
 - `POST /local/consents/{id}/revoke` 运行时撤销
+- `POST /local/consents/{id}/limits` 调整额度（可上调/下调，字段传 null 取消该项约束）
+- `POST /local/consents/{id}/extend?ttlSeconds=n` 续期
+- `GET  /local/consents/{id}/limits` 查看额度配置与当前累计用量
+- `POST /local/consents/{id}/usage/reset` 重置累计用量（演示用）
 - `POST /local/quotas/{partnerId}/limit?limit=n`、`POST /local/quotas/{partnerId}/reset`
 - `GET  /local/quotas`、`GET /local/payments/count`
 
 ---
 
-## 6. 本地验证方法
+## 7. 本地验证方法
 
 前置：JDK 21+、Maven（仓库已缓存 Spring Boot 3.4.1，支持离线 `-o`）。
 
-### 6.1 运行测试（34 个用例）
+### 7.1 运行测试（48 个用例）
 
 ```bash
 mvn test                 # 全量
@@ -154,16 +212,23 @@ mvn test -Dtest=ConsentServiceTest         # 授权边界 + 并发撤销一致�
 mvn test -Dtest=IdempotencyServiceTest     # 单次副作用/重放/冲突/并发/超期
 mvn test -Dtest=VersionServiceTest         # 版本兼容与拒绝
 mvn test -Dtest=PaymentIntegrationTest     # 全链路 HTTP（MockMvc）
+mvn test -Dtest=LimitServiceTest           # 额度判定/并发不透支/预占退回/调额续期
+mvn test -Dtest=PaymentLimitIntegrationTest # 额度全链路 HTTP（MockMvc）
 ```
 
 测试覆盖：过期 / 已撤销 / 范围不足 / 不存在的同意拒绝且原因可区分；同键并发重复提交
 只产生一次副作用；幂等内容冲突与超期复用被拒；v0/v9 版本拒绝；配额 429；下游异常 503
 不透出内部细节；运行时撤销后新请求拒绝而历史重放仍确定。
+本轮新增：单笔超限 / 累计超限 / 币种不符三种拒绝可区分；并发 20 笔抢 3 笔额度恰好
+放行 3 笔且用量等于上限（不透支）；同键重放不重复累计；下游异常与配额拒绝退回预占；
+调额下调即拒、上调即放且不动已有用量；续期期间并发支付只有 201 / CONSENT_EXPIRED
+两种确定结论；老请求方式与 v0 拒绝行为无回归。并发用例以发令枪对齐起跑、以确定性
+计数断言收口，反复运行结论一致。
 
 > 单测与应用层日志都会打印**请求输入与判定依据**（例如 `授权拒绝 ... 判定依据=同意已过期
 > now=... expiresAt=...`、`幂等判定 ... 判定依据=...`），便于解释每一次结论。
 
-### 6.2 启动后用 curl 演练
+### 7.2 启动后用 curl 演练
 
 ```bash
 mvn spring-boot:run        # 或 mvn package && java -jar target/*.jar
@@ -193,14 +258,47 @@ seq 1 20 | xargs -P20 -I{} curl -s -X POST localhost:8080/api/payments \
   -H 'X-Consent-Id: consent-ok' -H 'Idempotency-Key: hot' -H 'X-Api-Version: 2' -d "$B"
 ```
 
+额度演练（预置 `consent-capped`：单笔上限 100、累计上限 250、约定币种 GBP）：
+
+```bash
+H='-H Content-Type:application/json -H X-Partner-Id:partner-a -H X-Consent-Id:consent-capped'
+P() { curl -s -X POST localhost:8080/api/payments $H -H "Idempotency-Key: $1" \
+  -d "{\"paymentRef\":\"$1\",\"amount\":\"$2\",\"currency\":\"$3\",\"debtorAccountId\":\"DEB-1\",\"creditorAccountId\":\"CRE-9\"}"; echo; }
+
+P lim1 100.00 GBP     # 201，已用 100
+P lim2 100.00 GBP     # 201，已用 200
+P lim3 100.01 GBP     # 403 PAYMENT_LIMIT_EXCEEDED（超单笔上限）
+P lim4 10.00 EUR      # 403 CURRENCY_MISMATCH（币种不符）
+P lim5 60.00 GBP      # 403 CUMULATIVE_LIMIT_EXCEEDED（200+60 超 250）
+P lim2 100.00 GBP     # 同键重放 -> 201 + Idempotent-Replay，不重复累计
+curl -s localhost:8080/local/consents/consent-capped/limits   # 查看额度与已用（=200）
+
+# 调额与续期
+curl -s -X POST localhost:8080/local/consents/consent-capped/limits \
+  -H 'Content-Type: application/json' \
+  -d '{"perPaymentLimit":"100.00","cumulativeLimit":"500.00","limitCurrency":"GBP"}'
+P lim6 60.00 GBP      # 上调后 -> 201
+curl -s -X POST 'localhost:8080/local/consents/consent-capped/extend?ttlSeconds=86400'
+
+# 并发不透支：重新造一个累计上限 90 的同意，20 并发各 30 -> 恰好 3 个 201
+curl -s -X POST localhost:8080/local/consents -H 'Content-Type: application/json' -d \
+  '{"consentId":"consent-race","partnerId":"partner-a","scopes":["PAYMENTS_INITIATE","PAYMENTS_READ"],"ttlSeconds":3600,"perPaymentLimit":"100.00","cumulativeLimit":"90.00","limitCurrency":"GBP"}'
+seq 1 20 | xargs -P20 -I{} curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8080/api/payments \
+  -H 'Content-Type: application/json' -H 'X-Partner-Id: partner-a' -H 'X-Consent-Id: consent-race' \
+  -H "Idempotency-Key: race-{}" \
+  -d '{"paymentRef":"race-{}","amount":"30.00","currency":"GBP","debtorAccountId":"DEB-1","creditorAccountId":"CRE-9"}' | sort | uniq -c
+# 期望：3 个 201、17 个 403；GET /local/consents/consent-race/limits 的 used 恰为 90.00
+```
+
 ---
 
-## 7. 代码结构
+## 8. 代码结构
 
 ```
 common/        ErrorCode、ApiException、ErrorResponse、GlobalExceptionHandler（稳定错误语义）
 partner/       Partner、PartnerRepository
-consent/       PermissionScope、Consent(不可变快照)、ConsentRepository(CAS)、ConsentService(访问控制)
+consent/       PermissionScope、Consent(不可变快照,含可选额度字段)、ConsentRepository(CAS)、ConsentService(访问控制/调额/续期)
+limit/         LimitService(额度判定+原子预占/退回)、LimitReservation(幂等释放句柄)
 idempotency/   分段锁存储、IdempotencyRecord、IdempotencyService（PROCEED/REPLAY/拒绝）
 version/       ApiVersion、VersionService（缺省 v1 / v0 废弃 / 未知拒绝）
 quota/         QuotaService（合作方配额，真实执行才计费）

@@ -30,11 +30,13 @@ public class ConsentRepository {
     }
 
     /**
-     * 原子撤销：仅当存储中的当前引用与 {@code expected} 指向同一快照时才替换为 revoked。
+     * 原子替换：仅当存储中的当前引用与 {@code expected} 指向同一快照时才替换为
+     * {@code replacement}。撤销、调额、续期都通过该原语完成，保证并发修改彼此不覆盖，
+     * 且任何读线程拿到的引用都指向一个完整快照。
      *
-     * @return 替换成功返回 true；已被其他线程撤销（引用已变化）时返回 false
+     * @return 替换成功返回 true；引用已被其他线程改变时返回 false
      */
-    public boolean compareAndRevoke(Consent expected, Consent revoked) {
-        return consents.replace(revoked.consentId(), expected, revoked);
+    public boolean compareAndReplace(Consent expected, Consent replacement) {
+        return consents.replace(expected.consentId(), expected, replacement);
     }
 }

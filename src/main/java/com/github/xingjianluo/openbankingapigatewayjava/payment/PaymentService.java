@@ -10,12 +10,15 @@ import org.springframework.stereotype.Service;
 import com.github.xingjianluo.openbankingapigatewayjava.common.ApiException;
 import com.github.xingjianluo.openbankingapigatewayjava.common.ErrorCode;
 import com.github.xingjianluo.openbankingapigatewayjava.common.ErrorResponse;
+import com.github.xingjianluo.openbankingapigatewayjava.consent.Consent;
 import com.github.xingjianluo.openbankingapigatewayjava.consent.ConsentService;
 import com.github.xingjianluo.openbankingapigatewayjava.consent.PermissionScope;
 import com.github.xingjianluo.openbankingapigatewayjava.idempotency.IdempotencyDecision;
 import com.github.xingjianluo.openbankingapigatewayjava.idempotency.IdempotencyOutcome;
 import com.github.xingjianluo.openbankingapigatewayjava.idempotency.IdempotencyRecord;
 import com.github.xingjianluo.openbankingapigatewayjava.idempotency.IdempotencyService;
+import com.github.xingjianluo.openbankingapigatewayjava.limit.LimitReservation;
+import com.github.xingjianluo.openbankingapigatewayjava.limit.LimitService;
 import com.github.xingjianluo.openbankingapigatewayjava.partner.Partner;
 import com.github.xingjianluo.openbankingapigatewayjava.partner.PartnerRepository;
 import com.github.xingjianluo.openbankingapigatewayjava.quota.QuotaService;
@@ -39,6 +42,7 @@ public class PaymentService {
     private final ConsentService consentService;
     private final IdempotencyService idempotencyService;
     private final QuotaService quotaService;
+    private final LimitService limitService;
     private final UpstreamService upstreamService;
     private final PaymentRepository paymentRepository;
 
@@ -46,12 +50,14 @@ public class PaymentService {
                           ConsentService consentService,
                           IdempotencyService idempotencyService,
                           QuotaService quotaService,
+                          LimitService limitService,
                           UpstreamService upstreamService,
                           PaymentRepository paymentRepository) {
         this.partnerRepository = partnerRepository;
         this.consentService = consentService;
         this.idempotencyService = idempotencyService;
         this.quotaService = quotaService;
+        this.limitService = limitService;
         this.upstreamService = upstreamService;
         this.paymentRepository = paymentRepository;
     }
@@ -90,28 +96,43 @@ public class PaymentService {
             Partner partner = partnerRepository.findById(partnerId)
                     .orElseThrow(() -> new ApiException(ErrorCode.PARTNER_UNKNOWN,
                             "partnerId=" + partnerId));
-            consentService.authorize(partner, consentId, PermissionScope.PAYMENTS_INITIATE);
-            quotaService.acquire(partnerId);
+            Consent consent = consentService.authorize(partner, consentId,
+                    PermissionScope.PAYMENTS_INITIATE);
+            // 额度判定与授权基于同一份同意快照；通过即原子预占累计额度。
+            // 预占之后的任何失败（配额、下游异常）都必须退回预占：只有真正落账的请求
+            // 才消耗额度。预占之前的拒绝（授权/额度本身）不产生任何用量。
+            LimitReservation reservation = limitService.reserve(consent,
+                    request.amount(), request.currency());
+            boolean settled = false;
+            try {
+                quotaService.acquire(partnerId);
 
-            String paymentId = "PAY-" + UUID.randomUUID();
-            // 唯一一次副作用：调用下游核心并落资源
-            String ledgerNo = upstreamService.postPaymentInstruction(paymentId, failUpstream);
-            PaymentResponse response = new PaymentResponse(
-                    paymentId,
-                    request.paymentRef(),
-                    "INITIATED",
-                    ledgerNo,
-                    request.effectivePriority(),
-                    version.name(),
-                    partnerId,
-                    consentId,
-                    Instant.now());
-            paymentRepository.save(response);
+                String paymentId = "PAY-" + UUID.randomUUID();
+                // 唯一一次副作用：调用下游核心并落资源
+                String ledgerNo = upstreamService.postPaymentInstruction(paymentId, failUpstream);
+                PaymentResponse response = new PaymentResponse(
+                        paymentId,
+                        request.paymentRef(),
+                        "INITIATED",
+                        ledgerNo,
+                        request.effectivePriority(),
+                        version.name(),
+                        partnerId,
+                        consentId,
+                        Instant.now());
+                paymentRepository.save(response);
+                settled = true;
 
-            idempotencyService.complete(record, 201, response);
-            log.info("支付创建成功 请求输入 partnerId={} consentId={} idemKey={} paymentRef={} 判定依据=全部检查通过 paymentId={} ledgerNo={}",
-                    partnerId, consentId, idemKey, request.paymentRef(), paymentId, ledgerNo);
-            return new CreateResult(IdempotencyOutcome.PROCEED, 201, response);
+                idempotencyService.complete(record, 201, response);
+                log.info("支付创建成功 请求输入 partnerId={} consentId={} idemKey={} paymentRef={} 判定依据=全部检查通过 paymentId={} ledgerNo={}",
+                        partnerId, consentId, idemKey, request.paymentRef(), paymentId, ledgerNo);
+                return new CreateResult(IdempotencyOutcome.PROCEED, 201, response);
+            } finally {
+                if (!settled) {
+                    // 副作用未落账（配额拒绝/下游异常等）：退回预占，不白吃额度
+                    reservation.release();
+                }
+            }
         } catch (ApiException ex) {
             // 业务拒绝：缓存稳定错误语义作为该键的确定结论
             ErrorResponse body = ErrorResponse.of(ex.errorCode(), ex.reason());

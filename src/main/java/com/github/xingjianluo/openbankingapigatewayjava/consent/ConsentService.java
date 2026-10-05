@@ -104,9 +104,56 @@ public class ConsentService {
                 return false;
             }
             Consent revoked = current.asRevoked(Instant.now());
-            if (consentRepository.compareAndRevoke(current, revoked)) {
+            if (consentRepository.compareAndReplace(current, revoked)) {
                 log.info("撤销成功 consentId={} revokedAt={}", consentId, revoked.revokedAt());
                 return true;
+            }
+            // CAS 失败说明有并发修改，重读重试
+        }
+    }
+
+    /**
+     * 调整额度：CAS 循环把当前快照替换为仅额度字段不同的新快照。可上调也可下调；
+     * 传 {@code null} 表示取消该项约束。并发进行中的支付请求只会读到调整前或调整后的
+     * 完整快照之一，其结论相对所读快照是确定的，不会看到改到一半的中间状态。
+     *
+     * @return 调整生效后的新快照
+     */
+    public Consent updateLimits(String consentId, java.math.BigDecimal perPaymentLimit,
+                                java.math.BigDecimal cumulativeLimit, String limitCurrency) {
+        while (true) {
+            Consent current = consentRepository.findById(consentId).orElse(null);
+            if (current == null) {
+                throw new ApiException(ErrorCode.CONSENT_NOT_FOUND, "consentId=" + consentId);
+            }
+            Consent updated = current.withLimits(perPaymentLimit, cumulativeLimit, limitCurrency);
+            if (consentRepository.compareAndReplace(current, updated)) {
+                log.info("额度调整 consentId={} 旧额度=({}/{}/{}) 新额度=({}/{}/{})",
+                        consentId, current.perPaymentLimit(), current.cumulativeLimit(),
+                        current.limitCurrency(), perPaymentLimit, cumulativeLimit, limitCurrency);
+                return updated;
+            }
+            // CAS 失败说明有并发修改，重读重试
+        }
+    }
+
+    /**
+     * 续期：CAS 循环把有效期替换为新截止时间。与支付判定并发时，支付方只会基于
+     * 旧 expiresAt 或新 expiresAt 之一的完整快照得出结论。
+     *
+     * @return 续期生效后的新快照
+     */
+    public Consent extendExpiry(String consentId, Instant newExpiresAt) {
+        while (true) {
+            Consent current = consentRepository.findById(consentId).orElse(null);
+            if (current == null) {
+                throw new ApiException(ErrorCode.CONSENT_NOT_FOUND, "consentId=" + consentId);
+            }
+            Consent updated = current.withExpiry(newExpiresAt);
+            if (consentRepository.compareAndReplace(current, updated)) {
+                log.info("同意续期 consentId={} 旧expiresAt={} 新expiresAt={}",
+                        consentId, current.expiresAt(), newExpiresAt);
+                return updated;
             }
             // CAS 失败说明有并发修改，重读重试
         }
