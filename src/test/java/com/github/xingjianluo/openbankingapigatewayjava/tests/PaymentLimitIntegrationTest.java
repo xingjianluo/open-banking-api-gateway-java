@@ -367,6 +367,182 @@ class PaymentLimitIntegrationTest {
         log.info("[判定依据] 成功 {} 笔，已用={}", created.get() + 1, used(consentId));
     }
 
+    private String limitsField(String consentId, String field) throws Exception {
+        MvcResult r = mockMvc.perform(get("/local/consents/" + consentId + "/limits"))
+                .andExpect(status().isOk()).andReturn();
+        return MAPPER.readTree(r.getResponse().getContentAsString()).get(field).asText();
+    }
+
+    @Test
+    @DisplayName("续期只能延长：更短时长被拒（409 CONSENT_EXTENSION_INVALID），有效期/额度/用量原样不变")
+    void extendShorterRejectedKeepsEverything() throws Exception {
+        newPartner();
+        String consentId = newCappedConsent("ext-short", "100.00", "250.00", "GBP", 3600);
+
+        // 先成功支付一笔，让用量非零，便于验证"拒绝后用量也不变"
+        assertEquals(201, pay("k-es0-" + unique, consentId, "40.00", "GBP").getResponse().getStatus());
+        String expiryBefore = limitsField(consentId, "expiresAt");
+        String usedBefore = limitsField(consentId, "used");
+        log.info("[用例输入] consent={} 当前 expiresAt={} used={}，尝试续期 ttlSeconds=10（更短）",
+                consentId, expiryBefore, usedBefore);
+
+        MvcResult rejected = mockMvc.perform(post("/local/consents/" + consentId + "/extend")
+                        .param("ttlSeconds", "10"))
+                .andReturn();
+        logResult("更短续期", rejected);
+        assertEquals(409, rejected.getResponse().getStatus());
+        assertTrue(rejected.getResponse().getContentAsString().contains("CONSENT_EXTENSION_INVALID"),
+                "更短续期必须以可区分的 CONSENT_EXTENSION_INVALID 拒绝，不能当成成功");
+
+        // 有效期、额度配置、累计用量全部原样
+        assertEquals(expiryBefore, limitsField(consentId, "expiresAt"), "被拒后续期不得改动有效期");
+        assertEquals("100.00", limitsField(consentId, "perPaymentLimit"));
+        assertEquals("250.00", limitsField(consentId, "cumulativeLimit"));
+        assertEquals("GBP", limitsField(consentId, "limitCurrency"));
+        assertEquals(usedBefore, limitsField(consentId, "used"), "被拒后续期不得改动累计用量");
+
+        // 同意仍按原有效期正常使用
+        assertEquals(201, pay("k-es1-" + unique, consentId, "40.00", "GBP").getResponse().getStatus());
+        log.info("[判定依据] 拒绝后 expiresAt={} 不变，支付仍放行", limitsField(consentId, "expiresAt"));
+
+        // 更长的续期（相对原有效期更晚）仍然生效
+        MvcResult ok = mockMvc.perform(post("/local/consents/" + consentId + "/extend")
+                        .param("ttlSeconds", "7200"))
+                .andReturn();
+        assertEquals(200, ok.getResponse().getStatus());
+        log.info("[判定依据] 更长续期生效 expiresAt={}",
+                MAPPER.readTree(ok.getResponse().getContentAsString()).get("expiresAt").asText());
+    }
+
+    @Test
+    @DisplayName("已过期同意续期到未来：恢复正常使用，支付重新放行")
+    void extendExpiredConsentRestoresSequentially() throws Exception {
+        newPartner();
+        String consentId = newCappedConsent("ext-expired", "100.00", "250.00", "GBP", -1);
+
+        MvcResult expired = pay("k-ee0-" + unique, consentId, "10.00", "GBP");
+        assertEquals(403, expired.getResponse().getStatus());
+        assertTrue(expired.getResponse().getContentAsString().contains("CONSENT_EXPIRED"));
+        log.info("[用例输入] consent={} 已过期（支付被判 CONSENT_EXPIRED），续期 ttlSeconds=3600", consentId);
+
+        MvcResult extended = mockMvc.perform(post("/local/consents/" + consentId + "/extend")
+                        .param("ttlSeconds", "3600"))
+                .andReturn();
+        assertEquals(200, extended.getResponse().getStatus());
+
+        MvcResult after = pay("k-ee1-" + unique, consentId, "10.00", "GBP");
+        logResult("过期续期后支付", after);
+        assertEquals(201, after.getResponse().getStatus());
+        assertEquals(0, new BigDecimal("10.00").compareTo(used(consentId)),
+                "只有续期后真实成功的支付计入用量");
+        log.info("[判定依据] 过期同意续期后恢复可用，已用={}", used(consentId));
+    }
+
+    @Test
+    @DisplayName("已撤销同意续期：403 CONSENT_REVOKED，不复活、有效期不变")
+    void extendRevokedConsentRejected() throws Exception {
+        newPartner();
+        String consentId = newCappedConsent("ext-revoked", "100.00", "250.00", "GBP", 3600);
+        mockMvc.perform(post("/local/consents/" + consentId + "/revoke"))
+                .andExpect(status().isOk());
+        String expiryBefore = limitsField(consentId, "expiresAt");
+        log.info("[用例输入] consent={} 已撤销 expiresAt={}，尝试续期 ttlSeconds=86400", consentId, expiryBefore);
+
+        MvcResult rejected = mockMvc.perform(post("/local/consents/" + consentId + "/extend")
+                        .param("ttlSeconds", "86400"))
+                .andReturn();
+        logResult("撤销态续期", rejected);
+        assertEquals(403, rejected.getResponse().getStatus());
+        assertTrue(rejected.getResponse().getContentAsString().contains("CONSENT_REVOKED"));
+
+        assertEquals(expiryBefore, limitsField(consentId, "expiresAt"), "撤销态续期被拒，有效期不得改变");
+        assertEquals("REVOKED", limitsField(consentId, "status"), "续期不得把撤销态变回可用");
+        MvcResult payAfter = pay("k-er1-" + unique, consentId, "10.00", "GBP");
+        assertEquals(403, payAfter.getResponse().getStatus());
+        assertTrue(payAfter.getResponse().getContentAsString().contains("CONSENT_REVOKED"));
+        log.info("[判定依据] 撤销终态一致：续期拒、状态 REVOKED、支付仍 CONSENT_REVOKED");
+    }
+
+    @Test
+    @DisplayName("调额与支付直接并发：每笔只有 201 或 CUMULATIVE_LIMIT_EXCEEDED，用量恰为成功金额之和")
+    void adjustLimitConcurrentWithPaymentsDirect() throws Exception {
+        newPartner();
+        // 累计上限 90 只够 3 笔 30；并发期间管理侧把上限上调到 9000
+        String consentId = newCappedConsent("adj-race", "100.00", "90.00", "GBP", 3600);
+
+        int n = 20;
+        ExecutorService pool = Executors.newFixedThreadPool(n + 1);
+        CountDownLatch gun = new CountDownLatch(1);
+        CountDownLatch done = new CountDownLatch(n + 1);
+        AtomicInteger created = new AtomicInteger();
+        AtomicInteger limitRejected = new AtomicInteger();
+        AtomicInteger other = new AtomicInteger();
+        ConcurrentLinkedQueue<String> otherBodies = new ConcurrentLinkedQueue<>();
+
+        for (int i = 0; i < n; i++) {
+            final int idx = i;
+            pool.submit(() -> {
+                try {
+                    gun.await();
+                    MvcResult r = pay("k-adjr-" + idx + "-" + unique, consentId, "30.00", "GBP");
+                    int sc = r.getResponse().getStatus();
+                    String resp = r.getResponse().getContentAsString();
+                    if (sc == 201) {
+                        created.incrementAndGet();
+                    } else if (sc == 403 && resp.contains("CUMULATIVE_LIMIT_EXCEEDED")) {
+                        limitRejected.incrementAndGet();
+                    } else {
+                        other.incrementAndGet();
+                        otherBodies.add(sc + ":" + resp);
+                    }
+                } catch (Exception e) {
+                    other.incrementAndGet();
+                    otherBodies.add("EX:" + e.getMessage());
+                } finally {
+                    done.countDown();
+                }
+            });
+        }
+        // 与支付同一发令枪起跑的调额线程：上调累计上限到 9000
+        pool.submit(() -> {
+            try {
+                gun.await();
+                mockMvc.perform(post("/local/consents/" + consentId + "/limits")
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content(MAPPER.writeValueAsString(Map.of(
+                                        "perPaymentLimit", "100.00",
+                                        "cumulativeLimit", "9000.00",
+                                        "limitCurrency", "GBP"))))
+                        .andExpect(status().isOk());
+            } catch (Exception e) {
+                log.error("并发调额失败", e);
+                other.incrementAndGet();
+                otherBodies.add("ADJUST-EX:" + e.getMessage());
+            } finally {
+                done.countDown();
+            }
+        });
+        log.info("[用例输入] {} 笔 30.00 支付与「累计上限 90 -> 9000」调额同一发令枪并发", n);
+        gun.countDown();
+        assertTrue(done.await(60, TimeUnit.SECONDS));
+        pool.shutdown();
+
+        log.info("[并发调额] 201={} 累计超限403={} 其他={} 最终已用={}",
+                created.get(), limitRejected.get(), other.get(), used(consentId));
+        otherBodies.forEach(b -> log.error("[并发调额] 非预期响应 {}", b));
+        assertEquals(0, other.get(), "调额与支付并发只允许 201 / CUMULATIVE_LIMIT_EXCEEDED 两种确定结论");
+        assertEquals(n, created.get() + limitRejected.get());
+        // 用量绝不被调额弄乱：恰为成功支付金额之和，且不超过最终上限
+        BigDecimal expectedUsed = new BigDecimal("30.00").multiply(BigDecimal.valueOf(created.get()));
+        assertEquals(0, expectedUsed.compareTo(used(consentId)),
+                "用量必须恰好等于成功支付金额之和");
+        assertTrue(used(consentId).compareTo(new BigDecimal("9000.00")) <= 0);
+
+        // 调额完成后：新支付按新上限确定放行
+        assertEquals(201, pay("k-adjr-after-" + unique, consentId, "30.00", "GBP").getResponse().getStatus());
+        log.info("[判定依据] 并发期结论可解释，调额后已用={}，新支付按新上限放行", used(consentId));
+    }
+
     @Test
     @DisplayName("版本兼容回归：老请求方式行为不变；v0 仍拒绝；无额度同意不受新能力影响")
     void versionAndLegacyRegression() throws Exception {

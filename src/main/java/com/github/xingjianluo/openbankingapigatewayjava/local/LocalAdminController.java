@@ -119,7 +119,9 @@ public class LocalAdminController {
         return limitView(updated);
     }
 
-    /** 续期：把有效期延长为 now + ttlSeconds。 */
+    /** 续期：把有效期延长为 now + ttlSeconds。只能延长不能缩短——新截止时间不晚于
+     *  当前截止时间时拒绝（409 CONSENT_EXTENSION_INVALID），已撤销的同意拒绝（403
+     *  CONSENT_REVOKED）；被拒绝时同意保持原样。 */
     @PostMapping("/consents/{consentId}/extend")
     public Map<String, Object> extend(@PathVariable String consentId,
                                       @RequestParam long ttlSeconds) {
@@ -149,6 +151,8 @@ public class LocalAdminController {
     private Map<String, Object> limitView(Consent consent) {
         return Map.of(
                 "consentId", consent.consentId(),
+                "status", consent.status().name(),
+                "expiresAt", consent.expiresAt().toString(),
                 "perPaymentLimit", String.valueOf(consent.perPaymentLimit()),
                 "cumulativeLimit", String.valueOf(consent.cumulativeLimit()),
                 "limitCurrency", String.valueOf(consent.limitCurrency()),
