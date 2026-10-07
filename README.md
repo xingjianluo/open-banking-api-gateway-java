@@ -42,6 +42,29 @@
 
 > 撤销优先于过期判定（撤销是主动行为）；资源存在性在授权通过后才检查，避免未授权探测。
 
+### 1.4 续期语义：只能延长，不能缩短
+
+`POST /local/consents/{id}/extend?ttlSeconds=n` 把有效期更新为 `now + n`。**续期只能把
+有效期往后延**：新截止时间必须严格晚于当前 `expiresAt`，否则拒绝。固定判定顺序与
+**互不相同**的拒绝原因：
+
+| 顺序 | 情形 | 错误码 | HTTP |
+|---|---|---|---|
+| 1 | 同意不存在 | `CONSENT_NOT_FOUND` | 403 |
+| 2 | 同意已撤销（终态，不可通过续期回退） | `CONSENT_REVOKED` | 403 |
+| 3 | 新截止时间早于**或等于**当前截止时间 | `CONSENT_EXTENSION_INVALID` | 409 |
+
+要点：
+
+- **拒绝即不变**：所有拒绝都发生在 CAS 替换之前，被拒绝/失败的续期不会触碰有效期、
+  额度配置与已累计用量中的任何一项，不存在"只改了一半"的状态。
+- **过期可恢复**：已过期的同意续期到未来后自然恢复可用（状态保持 `AUTHORISED`，
+  过期本就是动态判定），额度配置与累计用量原样保留。
+- **撤销不回退**：已撤销的同意续期一律 `CONSENT_REVOKED`，之后授权结论依然是撤销，
+  不会因为续期变回可用。
+- **并发确定**：续期与支付并发时，支付只读到续期前或续期后的完整快照之一
+  （详见 2.2）；并发续期/撤销/调额彼此通过 CAS 串行化，重试时基于最新快照重新校验。
+
 预置同意：`consent-ok`（有效）、`consent-expired`（过期）、`consent-revoked`（已撤销）、
 `consent-noinitiate`（有效但只含 read）、`consent-cross`（归属 partner-limited）、
 `consent-capped`（带额度：单笔 100 / 累计 250 / GBP）。
@@ -85,9 +108,13 @@
   重复/并发释放只退一次。被拒绝的请求在预占前就已抛出、幂等重放根本走不到额度判定，
   两者都不消耗额度；同键重放拿到的是首次缓存的确定结果，不重复累计。
 - **调额/续期无中间态**：调额（`POST /local/consents/{id}/limits`，可上调/下调/取消
-  约束）与续期（`POST /local/consents/{id}/extend`）都是把同意快照整体 CAS 替换。
-  并发进行中的支付只读到调整前或调整后的**完整快照之一**，结论相对所读快照确定：
-  例如下调后新请求按新上限拒绝、上调后新请求放行，而已有用量不受调额影响。
+  约束）与续期（`POST /local/consents/{id}/extend`，只能延长不能缩短，见 1.4）都是把
+  同意快照整体 CAS 替换。并发进行中的支付只读到调整前或调整后的**完整快照之一**，
+  结论相对所读快照确定：例如下调后新请求按新上限拒绝、上调后新请求放行，而已有用量
+  不受调额/续期影响。调额与支付并发时，每笔支付只会得到 `201` 或
+  `CUMULATIVE_LIMIT_EXCEEDED` 等可解释结论，成功笔数必然落在"旧上限能放行的笔数"与
+  "新上限能放行的笔数"之间，最终用量恰好等于成功支付金额之和——绝不出现第三种结果，
+  也不会把正在使用的额度弄乱。
 
 ### 2.3 版本兼容范围
 
@@ -166,6 +193,7 @@
 | `VERSION_DEPRECATED` | 400 | 版本已废弃且不兼容 |
 | `PARTNER_UNKNOWN` | 401 | 合作方缺失/不存在 |
 | `CONSENT_NOT_FOUND` / `CONSENT_REVOKED` / `CONSENT_EXPIRED` / `SCOPE_INSUFFICIENT` | 403 | 四种可区分的授权拒绝 |
+| `CONSENT_EXTENSION_INVALID` | 409 | 续期目标未晚于当前截止时间（续期只能延长不能缩短） |
 | `PAYMENT_LIMIT_EXCEEDED` / `CUMULATIVE_LIMIT_EXCEEDED` / `CURRENCY_MISMATCH` | 403 | 三种可区分的额度拒绝（单笔超限 / 累计将超 / 币种不符） |
 | `RESOURCE_NOT_FOUND` | 404 | 资源不存在/跨租户不可见 |
 | `IDEMPOTENCY_IN_FLIGHT` / `IDEMPOTENCY_CONFLICT` | 409 | 处理中并发 / 内容或归属冲突 |
@@ -192,7 +220,8 @@
   `perPaymentLimit / cumulativeLimit / limitCurrency` 带额度）
 - `POST /local/consents/{id}/revoke` 运行时撤销
 - `POST /local/consents/{id}/limits` 调整额度（可上调/下调，字段传 null 取消该项约束）
-- `POST /local/consents/{id}/extend?ttlSeconds=n` 续期
+- `POST /local/consents/{id}/extend?ttlSeconds=n` 续期（只能延长：新截止时间必须晚于
+  当前 `expiresAt`，否则 `CONSENT_EXTENSION_INVALID`/409；已撤销同意续期 `CONSENT_REVOKED`/403）
 - `GET  /local/consents/{id}/limits` 查看额度配置与当前累计用量
 - `POST /local/consents/{id}/usage/reset` 重置累计用量（演示用）
 - `POST /local/quotas/{partnerId}/limit?limit=n`、`POST /local/quotas/{partnerId}/reset`
@@ -204,11 +233,13 @@
 
 前置：JDK 21+、Maven（仓库已缓存 Spring Boot 3.4.1，支持离线 `-o`）。
 
-### 7.1 运行测试（48 个用例）
+### 7.1 运行测试（57 个用例）
 
 ```bash
 mvn test                 # 全量
 mvn test -Dtest=ConsentServiceTest         # 授权边界 + 并发撤销一致性
+mvn test -Dtest=ConsentRenewalTest         # 续期语义：只延不缩/拒绝不变/过期恢复/撤销不回退/并发续期
+mvn test -Dtest=ConsentRenewalIntegrationTest # 续期全链路 HTTP（MockMvc）
 mvn test -Dtest=IdempotencyServiceTest     # 单次副作用/重放/冲突/并发/超期
 mvn test -Dtest=VersionServiceTest         # 版本兼容与拒绝
 mvn test -Dtest=PaymentIntegrationTest     # 全链路 HTTP（MockMvc）
@@ -222,8 +253,14 @@ mvn test -Dtest=PaymentLimitIntegrationTest # 额度全链路 HTTP（MockMvc）
 本轮新增：单笔超限 / 累计超限 / 币种不符三种拒绝可区分；并发 20 笔抢 3 笔额度恰好
 放行 3 笔且用量等于上限（不透支）；同键重放不重复累计；下游异常与配额拒绝退回预占；
 调额下调即拒、上调即放且不动已有用量；续期期间并发支付只有 201 / CONSENT_EXPIRED
-两种确定结论；老请求方式与 v0 拒绝行为无回归。并发用例以发令枪对齐起跑、以确定性
-计数断言收口，反复运行结论一致。
+两种确定结论；老请求方式与 v0 拒绝行为无回归。本轮新增：续期只能延长不能缩短——
+更短/相等的续期目标返回 409 `CONSENT_EXTENSION_INVALID`（与其它失败原因可区分），
+被拒绝的续期不触碰有效期、额度配置与累计用量中的任何一项；已过期同意续期到未来后
+恢复正常使用；已撤销同意续期返回 403 `CONSENT_REVOKED` 且不会变回可用；续期与授权
+并发只有 PASS / CONSENT_EXPIRED 两种结论；调额与支付**直接并发**（发令枪对齐起跑）
+时每笔只有 201 / CUMULATIVE_LIMIT_EXCEEDED 两种结论，成功笔数落在可解释区间
+[旧上限可放行数, 新上限可放行数]，最终用量恰好等于成功金额之和。并发用例以发令枪
+对齐起跑、以确定性计数断言收口，反复运行结论一致。
 
 > 单测与应用层日志都会打印**请求输入与判定依据**（例如 `授权拒绝 ... 判定依据=同意已过期
 > now=... expiresAt=...`、`幂等判定 ... 判定依据=...`），便于解释每一次结论。
@@ -278,7 +315,9 @@ curl -s -X POST localhost:8080/local/consents/consent-capped/limits \
   -H 'Content-Type: application/json' \
   -d '{"perPaymentLimit":"100.00","cumulativeLimit":"500.00","limitCurrency":"GBP"}'
 P lim6 60.00 GBP      # 上调后 -> 201
-curl -s -X POST 'localhost:8080/local/consents/consent-capped/extend?ttlSeconds=86400'
+curl -s -X POST 'localhost:8080/local/consents/consent-capped/extend?ttlSeconds=86400'   # 延长 -> 200
+curl -s -X POST 'localhost:8080/local/consents/consent-capped/extend?ttlSeconds=60'
+# ^ 新截止时间比当前还早 -> 409 CONSENT_EXTENSION_INVALID，有效期/额度/用量均不变
 
 # 并发不透支：重新造一个累计上限 90 的同意，20 并发各 30 -> 恰好 3 个 201
 curl -s -X POST localhost:8080/local/consents -H 'Content-Type: application/json' -d \

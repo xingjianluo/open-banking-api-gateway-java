@@ -368,6 +368,85 @@ class PaymentLimitIntegrationTest {
     }
 
     @Test
+    @DisplayName("调额与支付并发：每笔只有 201 或 CUMULATIVE_LIMIT_EXCEEDED，成功数落在可解释区间，用量不被弄乱")
+    void concurrentLimitAdjustmentAndPayments() throws Exception {
+        newPartner();
+        // 累计上限 500：20 笔各 100 的并发支付在旧快照下恰好放行 5 笔；
+        // 并发调额线程把上限上调到 1000，读到新快照的支付最多再放行到 10 笔。
+        String consentId = newCappedConsent("adjrace", "100.00", "500.00", "GBP", 3600);
+
+        int n = 20;
+        ExecutorService pool = Executors.newFixedThreadPool(n + 1);
+        CountDownLatch gun = new CountDownLatch(1);
+        CountDownLatch done = new CountDownLatch(n + 1);
+        AtomicInteger created = new AtomicInteger();
+        AtomicInteger limitRejected = new AtomicInteger();
+        AtomicInteger other = new AtomicInteger();
+        ConcurrentLinkedQueue<String> otherBodies = new ConcurrentLinkedQueue<>();
+
+        for (int i = 0; i < n; i++) {
+            final int idx = i;
+            pool.submit(() -> {
+                try {
+                    gun.await();
+                    MvcResult r = pay("k-adjrace-" + idx + "-" + unique, consentId, "100.00", "GBP");
+                    int sc = r.getResponse().getStatus();
+                    String resp = r.getResponse().getContentAsString();
+                    if (sc == 201) {
+                        created.incrementAndGet();
+                    } else if (sc == 403 && resp.contains("CUMULATIVE_LIMIT_EXCEEDED")) {
+                        limitRejected.incrementAndGet();
+                    } else {
+                        other.incrementAndGet();
+                        otherBodies.add(sc + ":" + resp);
+                    }
+                } catch (Exception e) {
+                    other.incrementAndGet();
+                    otherBodies.add("EX:" + e.getMessage());
+                } finally {
+                    done.countDown();
+                }
+            });
+        }
+        // 与支付并发执行调额：500 -> 1000
+        pool.submit(() -> {
+            try {
+                gun.await();
+                mockMvc.perform(post("/local/consents/" + consentId + "/limits")
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content(MAPPER.writeValueAsString(Map.of(
+                                        "perPaymentLimit", "100.00",
+                                        "cumulativeLimit", "1000.00",
+                                        "limitCurrency", "GBP"))))
+                        .andExpect(status().isOk());
+            } catch (Exception e) {
+                log.error("调额失败", e);
+            } finally {
+                done.countDown();
+            }
+        });
+        gun.countDown();
+        assertTrue(done.await(60, TimeUnit.SECONDS));
+        pool.shutdown();
+
+        log.info("[并发调额] 201={} 累计超限403={} 其他={} 最终已用={}",
+                created.get(), limitRejected.get(), other.get(), used(consentId));
+        otherBodies.forEach(b -> log.error("[并发调额] 非预期响应 {}", b));
+        assertEquals(0, other.get(), "调额与支付并发期间只允许 201 或 CUMULATIVE_LIMIT_EXCEEDED 两种确定结论");
+        assertEquals(n, created.get() + limitRejected.get());
+        // 成功数可解释：旧上限 500 下至少放行 5 笔；新上限 1000 下至多放行 10 笔
+        assertTrue(created.get() >= 5 && created.get() <= 10,
+                "成功笔数必须落在 [5,10] 可解释区间，实际=" + created.get());
+        // 用量恰为成功金额之和，绝不透支、不被调额弄乱
+        BigDecimal expectedUsed = new BigDecimal("100.00")
+                .multiply(BigDecimal.valueOf(created.get()));
+        assertEquals(0, expectedUsed.compareTo(used(consentId)),
+                "用量必须恰好等于成功支付金额之和");
+        log.info("[判定依据] 成功 {} 笔（区间[5,10]），已用={} 与成功金额之和一致",
+                created.get(), used(consentId));
+    }
+
+    @Test
     @DisplayName("版本兼容回归：老请求方式行为不变；v0 仍拒绝；无额度同意不受新能力影响")
     void versionAndLegacyRegression() throws Exception {
         newPartner();

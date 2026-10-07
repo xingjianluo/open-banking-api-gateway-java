@@ -11,6 +11,7 @@ import org.springframework.http.HttpStatus;
  * <ul>
  *   <li>同意与访问控制：CONSENT_NOT_FOUND / CONSENT_EXPIRED / CONSENT_REVOKED /
  *       SCOPE_INSUFFICIENT / RESOURCE_NOT_FOUND 五种拒绝原因互不相同；</li>
+ *   <li>续期：CONSENT_EXTENSION_INVALID（新截止时间不晚于当前截止时间，只能延长不能缩短）；</li>
  *   <li>额度：PAYMENT_LIMIT_EXCEEDED / CUMULATIVE_LIMIT_EXCEEDED / CURRENCY_MISMATCH
  *       三种额度拒绝原因互不相同；</li>
  *   <li>幂等：IDEMPOTENCY_IN_FLIGHT / IDEMPOTENCY_CONFLICT / IDEMPOTENCY_KEY_EXPIRED；</li>
@@ -34,6 +35,9 @@ public enum ErrorCode {
 
     /** 同意已被合作方/客户撤销。 */
     CONSENT_REVOKED("同意已撤销", HttpStatus.FORBIDDEN),
+
+    /** 续期请求的新截止时间早于或等于当前截止时间：续期只能延长不能缩短。 */
+    CONSENT_EXTENSION_INVALID("续期只能延长有效期，新截止时间必须晚于当前截止时间", HttpStatus.CONFLICT),
 
     /** 同意或合作方被授予的权限范围不覆盖本次操作所需 scope。 */
     SCOPE_INSUFFICIENT("权限范围不足", HttpStatus.FORBIDDEN),

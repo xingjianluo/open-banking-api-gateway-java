@@ -138,8 +138,25 @@ public class ConsentService {
     }
 
     /**
-     * 续期：CAS 循环把有效期替换为新截止时间。与支付判定并发时，支付方只会基于
-     * 旧 expiresAt 或新 expiresAt 之一的完整快照得出结论。
+     * 续期：只能把有效期往后延，不能改短。CAS 循环把有效期替换为更晚的新截止时间。
+     *
+     * <p>判定顺序固定且每种拒绝原因互不相同：</p>
+     * <ol>
+     *   <li>同意不存在 → {@code CONSENT_NOT_FOUND}；</li>
+     *   <li>同意已撤销（终态）→ {@code CONSENT_REVOKED}：撤销不可通过续期回退，
+     *       已撤销的同意续期后依然不可用，结论明确一致；</li>
+     *   <li>新截止时间早于或等于当前截止时间 → {@code CONSENT_EXTENSION_INVALID}：
+     *       续期只能延长，拒绝把还剩很久的同意改短甚至直接改失效。</li>
+     * </ol>
+     *
+     * <p><b>原子性：</b>所有拒绝都发生在 CAS 替换之前，被拒绝/失败的续期不会触碰
+     * 有效期、额度配置与累计用量中的任何一项，不存在"只改了一半"的状态。CAS 失败时
+     * 重读最新快照并重新执行全部校验，因此并发修改（撤销/调额/另一次续期）后结论仍然
+     * 相对最新完整状态确定。已过期的同意续期到未来后自然恢复可用（状态保持
+     * AUTHORISED，过期本就是动态判定）。</p>
+     *
+     * <p><b>与支付并发：</b>支付方只会基于旧 expiresAt 或新 expiresAt 之一的完整快照
+     * 得出结论，不会读到中间态。</p>
      *
      * @return 续期生效后的新快照
      */
@@ -149,13 +166,26 @@ public class ConsentService {
             if (current == null) {
                 throw new ApiException(ErrorCode.CONSENT_NOT_FOUND, "consentId=" + consentId);
             }
+            if (current.status() == ConsentStatus.REVOKED) {
+                log.info("续期拒绝 请求输入 consentId={} newExpiresAt={} 判定依据=同意已撤销(终态不可回退) revokedAt={}",
+                        consentId, newExpiresAt, current.revokedAt());
+                throw new ApiException(ErrorCode.CONSENT_REVOKED,
+                        "consentId=" + consentId + " 已于 " + current.revokedAt() + " 撤销，撤销不可通过续期回退");
+            }
+            if (!newExpiresAt.isAfter(current.expiresAt())) {
+                log.info("续期拒绝 请求输入 consentId={} newExpiresAt={} 判定依据=新截止时间未晚于当前截止时间 当前expiresAt={}",
+                        consentId, newExpiresAt, current.expiresAt());
+                throw new ApiException(ErrorCode.CONSENT_EXTENSION_INVALID,
+                        "consentId=" + consentId + " 当前有效期截止 " + current.expiresAt()
+                                + "，续期目标 " + newExpiresAt + " 未更晚，续期只能延长不能缩短");
+            }
             Consent updated = current.withExpiry(newExpiresAt);
             if (consentRepository.compareAndReplace(current, updated)) {
                 log.info("同意续期 consentId={} 旧expiresAt={} 新expiresAt={}",
                         consentId, current.expiresAt(), newExpiresAt);
                 return updated;
             }
-            // CAS 失败说明有并发修改，重读重试
+            // CAS 失败说明有并发修改，重读最新快照并重新执行全部校验
         }
     }
 }

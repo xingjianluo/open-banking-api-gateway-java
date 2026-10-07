@@ -192,6 +192,12 @@ class ConsentServiceTest {
         pool.submit(() -> {
             try {
                 start.await();
+                // 等至少一笔授权成功后再撤销，保证"撤销前放行/撤销后拒绝"两种结论都必然出现，
+                // 避免撤销线程跑赢全部授权线程导致结论退化为只有一种（反复运行不稳定）
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                while (verdicts.get("PASS").get() == 0 && System.nanoTime() < deadline) {
+                    Thread.yield();
+                }
                 service.revoke("c-ok");
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
